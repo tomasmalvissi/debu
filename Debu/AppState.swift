@@ -37,6 +37,7 @@ final class AppState {
     func startBackgroundWork() {
         guard !backgroundWorkStarted else { return }
         backgroundWorkStarted = true
+        startWatchingRootFolders()
         Task {
             await scanProjects()
             await runAutoRefresh()
@@ -101,12 +102,14 @@ final class AppState {
         rootFolders.append(contentsOf: newPaths)
         rootFolders.sort()
         UserDefaults.standard.set(rootFolders, forKey: Keys.rootFolders)
+        startWatchingRootFolders()
         await scanProjects()
     }
 
     func removeRootFolders(_ paths: Set<String>) async {
         rootFolders.removeAll { paths.contains($0) }
         UserDefaults.standard.set(rootFolders, forKey: Keys.rootFolders)
+        startWatchingRootFolders()
         await scanProjects()
     }
 
@@ -115,7 +118,43 @@ final class AppState {
         isScanning = true
         defer { isScanning = false }
         projects = await ProjectDiscovery.discover(in: rootFolders)
+        lastScan = .now
         rematch()
+    }
+
+    // MARK: - Actualización automática de la lista (cambios de rama, proyectos nuevos)
+
+    /// Última vez que se recorrieron las carpetas raíz.
+    private(set) var lastScan: Date?
+
+    /// Vigila las carpetas raíz. `@ObservationIgnored`: la interfaz no necesita redibujarse por él.
+    @ObservationIgnored private var folderWatcher: FolderWatcher?
+    /// Reescaneo pendiente: se reprograma con cada aviso para esperar a que termine la ráfaga de cambios.
+    @ObservationIgnored private var pendingRescan: Task<Void, Never>?
+
+    private func startWatchingRootFolders() {
+        if folderWatcher == nil {
+            // El aviso llega en un hilo de fondo: se pasa al hilo principal (como Dispatcher.Invoke).
+            // AppState vive mientras corre la app, así que se captura directo (no hace falta `weak`).
+            folderWatcher = FolderWatcher { [self] paths in
+                Task { @MainActor in self.handleFolderChanges(paths) }
+            }
+        }
+        folderWatcher?.watch(rootFolders)
+    }
+
+    /// Si cambió un .csproj, un launchSettings.json o una carpeta de proyecto, vuelve a buscar proyectos.
+    /// Espera 1,5 segundos sin cambios nuevos: un cambio de rama toca muchos archivos de una vez.
+    private func handleFolderChanges(_ paths: [String]) {
+        let projectDirectories = Set(projects.map(\.directory))
+        guard paths.contains(where: { FolderWatcher.isRelevant($0, knownProjectDirectories: projectDirectories) }) else { return }
+
+        pendingRescan?.cancel()
+        pendingRescan = Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            await scanProjects()
+        }
     }
 
     // MARK: - Agrupación por proyecto (RF-02, RF-03, RF-04)
@@ -354,34 +393,118 @@ final class AppState {
         var urls: [String]
     }
 
-    /// PIDs que se están reiniciando.
-    private(set) var restartingPids: Set<Int32> = []
+    /// Proyectos con una acción en curso (reiniciar o detener): sus botones muestran un indicador.
+    private(set) var busyProjectIds: Set<String> = []
 
-    /// Detiene la instancia y la vuelve a iniciar con el mismo proyecto, perfil y puertos.
-    func restart(_ process: RunningProcess) async {
-        guard let project = match.projectByPid[process.pid] else {
-            actionError = "No se puede reiniciar: el proceso no está asociado a ningún proyecto."
-            return
-        }
-        restartingPids.insert(process.pid)
-        defer { restartingPids.remove(process.pid) }
+    func isBusy(_ project: DotnetProject) -> Bool {
+        busyProjectIds.contains(project.id)
+    }
+
+    /// El proyecto está corriendo o arrancando (compilando).
+    func isRunning(_ project: DotnetProject) -> Bool {
+        !instances(of: project).isEmpty || !startingLaunches(of: project).isEmpty
+    }
+
+    /// Reiniciar el proyecto: detiene todas sus instancias e inicia una sola, con el perfil y los puertos
+    /// de la más reciente. Si había duplicados, después del reinicio queda una.
+    func restartProject(_ project: DotnetProject) async {
+        guard !isBusy(project) else { return }
+        busyProjectIds.insert(project.id)
+        defer { busyProjectIds.remove(project.id) }
 
         // El plan se arma antes de detener: después ya no existe la línea de comandos.
         let plan: StartPlan
-        if let launch = launch(for: process) {
-            plan = StartPlan(profile: launch.profile, withSecrets: launch.withSecrets, urls: launch.urls)
+        if let newest = instances(of: project).first {
+            if let launch = launch(for: newest) {
+                plan = StartPlan(profile: launch.profile, withSecrets: launch.withSecrets, urls: launch.urls)
+            } else {
+                plan = await externalRestartPlan(for: newest, project: project)
+            }
+        } else if let starting = startingLaunches(of: project).first {
+            plan = StartPlan(profile: starting.profile, withSecrets: starting.withSecrets, urls: starting.urls)
         } else {
-            plan = await externalRestartPlan(for: process, project: project)
-        }
-
-        do {
-            try await ProcessController.stop(pid: process.pid, expectedStart: process.startDate)
-        } catch {
-            actionError = error.localizedDescription
+            launch(project)  // no estaba corriendo: reiniciar equivale a iniciar
             return
         }
+
+        guard await stopEverything(of: project) else { return }
         launch(project, plan: plan)
         await refresh()
+    }
+
+    /// Detener el proyecto: todas sus instancias y las ejecuciones que todavía arrancan.
+    func stopProject(_ project: DotnetProject) async {
+        guard !isBusy(project) else { return }
+        busyProjectIds.insert(project.id)
+        defer { busyProjectIds.remove(project.id) }
+        _ = await stopEverything(of: project)
+        await refresh()
+    }
+
+    /// Detiene instancias y ejecuciones en arranque del proyecto. Devuelve `false` si algo falló.
+    private func stopEverything(of project: DotnetProject) async -> Bool {
+        let targets: [(pid: Int32, start: Date?)] =
+            instances(of: project).map { ($0.pid, $0.startDate) } +
+            startingLaunches(of: project).map { ($0.pid, nil) }
+        stoppingPids.formUnion(targets.map(\.pid))
+        defer { stoppingPids.subtract(targets.map(\.pid)) }
+
+        let errors = await withTaskGroup(of: String?.self) { group in
+            for target in targets {
+                group.addTask {
+                    do {
+                        try await ProcessController.stop(pid: target.pid, expectedStart: target.start)
+                        return nil
+                    } catch {
+                        return error.localizedDescription
+                    }
+                }
+            }
+            var messages: [String] = []
+            for await message in group {
+                if let message { messages.append(message) }
+            }
+            return messages
+        }
+        if !errors.isEmpty {
+            actionError = errors.joined(separator: "\n")
+        }
+        return errors.isEmpty
+    }
+
+    // MARK: - Favoritos
+
+    /// Proyectos marcados con la estrella (ruta del .csproj). Se guardan entre ejecuciones.
+    private(set) var favoriteIds: Set<String> = Set(UserDefaults.standard.stringArray(forKey: Keys.favorites) ?? [])
+
+    func isFavorite(_ project: DotnetProject) -> Bool {
+        favoriteIds.contains(project.id)
+    }
+
+    func toggleFavorite(_ project: DotnetProject) {
+        if favoriteIds.contains(project.id) {
+            favoriteIds.remove(project.id)
+        } else {
+            favoriteIds.insert(project.id)
+        }
+        UserDefaults.standard.set(Array(favoriteIds).sorted(), forKey: Keys.favorites)
+    }
+
+    /// Proyectos de la barra de menú: favoritos y cualquiera que esté corriendo.
+    /// Primero los que corren, después por nombre.
+    var menuProjects: [DotnetProject] {
+        projects
+            .filter { isFavorite($0) || isRunning($0) }
+            .sorted {
+                let lhs = isRunning($0), rhs = isRunning($1)
+                if lhs != rhs { return lhs }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+    }
+
+    /// Instancias .NET en escucha que no pertenecen a ningún proyecto conocido.
+    var looseDotnetInstances: [RunningProcess] {
+        match.unmatched.filter(\.isDotnet)
     }
 
     /// Recupera de la línea de comandos (del proceso y de su `dotnet run` / `dotnet watch`) el perfil y las URLs.
@@ -476,5 +599,6 @@ final class AppState {
         static let rootFolders = "rootFolders"
         static let dotnetPath = "dotnetPath"
         static let lastProfiles = "lastProfileByProject"
+        static let favorites = "favoriteProjects"
     }
 }

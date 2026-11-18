@@ -64,7 +64,10 @@ nonisolated enum ProjectDiscovery {
             name: URL(fileURLWithPath: csprojPath).deletingPathExtension().lastPathComponent,
             directory: directory,
             profiles: hasLaunchSettings ? readProfiles(launchSettingsPath) : [],
-            hasUserSecrets: content.contains("<UserSecretsId>")
+            hasUserSecrets: content.contains("<UserSecretsId>"),
+            iconPath: ["favicon.png", "icon-192.png", "favicon.ico"]
+                .map { directory + "/wwwroot/" + $0 }
+                .first { FileManager.default.fileExists(atPath: $0) }
         )
     }
 

@@ -25,7 +25,7 @@ struct SettingsView: View {
                 if loginItemState == .requiresApproval {
                     HStack {
                         Label("macOS pide aprobarlo en Ítems de inicio.", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(.red)
                         Spacer()
                         Button("Abrir Ajustes del Sistema") { LoginItem.openSystemSettings() }
                     }
@@ -95,7 +95,7 @@ struct SettingsView: View {
             } header: {
                 Text("Carpetas raíz")
             } footer: {
-                Text("Se buscan proyectos web .NET de forma recursiva. Se omiten bin, obj, node_modules y las carpetas ocultas.")
+                Text("Se buscan proyectos web .NET de forma recursiva (se omiten bin, obj, node_modules y las carpetas ocultas). La lista se actualiza sola cuando cambia un .csproj o un launchSettings.json, por ejemplo al cambiar de rama.")
                     .foregroundStyle(.secondary)
             }
         }

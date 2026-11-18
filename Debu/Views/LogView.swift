@@ -15,7 +15,7 @@ struct LogView: View {
                 } icon: {
                     Image(systemName: "lock.trianglebadge.exclamationmark")
                 }
-                .foregroundStyle(.orange)
+                .foregroundStyle(.red)
                 .textSelection(.enabled)
             }
 
@@ -70,7 +70,7 @@ struct LogView: View {
                 .foregroundStyle(code == 0 ? Color.secondary : Color.red)
         } else {
             Label("En ejecución", systemImage: "play.circle.fill")
-                .foregroundStyle(.green)
+                .foregroundStyle(.primary)
         }
     }
 }

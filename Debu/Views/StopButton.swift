@@ -22,8 +22,13 @@ struct StopButton: View {
                     Task { await appState.stop(process) }
                 }
             } label: {
-                Label("Detener", systemImage: "stop.fill")
-                    .labelStyle(.titleAndIcon)
+                Label {
+                    Text("Detener")
+                } icon: {
+                    // Rojo: único color de acento de la app, reservado para detener y para los duplicados.
+                    Image(systemName: "stop.fill").foregroundStyle(.red)
+                }
+                .labelStyle(.titleAndIcon)
             }
             .controlSize(.small)
         }

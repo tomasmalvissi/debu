@@ -19,7 +19,8 @@ struct SidebarView: View {
                     emptyProjects
                 }
                 ForEach(appState.sortedProjects) { project in
-                    ProjectRow(project: project, count: appState.instances(of: project).count)
+                    ProjectRow(project: project, count: appState.instances(of: project).count,
+                               isFavorite: appState.isFavorite(project))
                         .tag(SidebarItem.project(project.id))
                 }
             }
@@ -83,6 +84,7 @@ struct SidebarView: View {
 private struct ProjectRow: View {
     let project: DotnetProject
     let count: Int
+    let isFavorite: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -92,17 +94,23 @@ private struct ProjectRow: View {
                 .help(statusHelp)
             Text(project.name)
                 .lineLimit(1)
+            if isFavorite {
+                Image(systemName: "star.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help("Favorito: aparece siempre en la barra de menú")
+            }
             Spacer()
             if count > 1 {
                 // RF-04: marca visual cuando hay más de una instancia.
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.red)
                     .help("Hay \(count) instancias de este proyecto")
             }
             if count > 0 {
                 Text("\(count)")
                     .font(.callout.monospacedDigit())
-                    .foregroundStyle(count > 1 ? .orange : .secondary)
+                    .foregroundStyle(count > 1 ? .red : .secondary)
             }
         }
     }
@@ -110,8 +118,8 @@ private struct ProjectRow: View {
     private var statusColor: Color {
         switch count {
         case 0: .gray.opacity(0.4)
-        case 1: .green
-        default: .orange
+        case 1: .primary
+        default: .red
         }
     }
 
